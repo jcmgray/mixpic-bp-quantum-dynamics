@@ -1,0 +1,6 @@
+torch
+xyzpy @ git+https://github.com/jcmgray/xyzpy
+autoray @ git+https://github.com/jcmgray/autoray
+quimb @ git+https://github.com/jcmgray/quimb
+cotengra @ git+https://github.com/jcmgray/cotengra
+cotengrust
