@@ -14,7 +14,6 @@ Memory usage is approx:
 - 8 * 30 *  4 * chi**3 bytes for PEPO
 - 8 * 30 * 12 * chi**3 bytes for MIX
 
-
 """
 
 import collections
@@ -44,6 +43,7 @@ def get_optimizer_exact(
     target_size=2**27,
     minimize="combo",
     max_time="rate:1e8",
+    optlib="nevergrad",
     directory=True,
     progbar=False,
     **kwargs,
@@ -72,9 +72,24 @@ def get_optimizer_exact(
         progbar=progbar,
         minimize=minimize,
         max_time=max_time,
+        optlib=optlib,
         directory=directory,
         **kwargs,
     )
+
+
+def choose_optimizer(optimize, chi, version, target_size=2**27):
+    if optimize is None:
+        if ("square" in version) or ("torus" in version):
+            # square lattices
+            if chi <= 12:
+                return "auto-hq"
+
+        elif chi <= 64:
+            # heavy hex or loops
+            return "auto-hq"
+
+    return get_optimizer_exact(target_size=target_size)
 
 
 ibm_kyiv_edges = {
@@ -315,14 +330,10 @@ loop_21_edges = [
 ]
 
 coo2int = collections.defaultdict(itertools.count().__next__)
-square_16_edges = tuple(
-    (coo2int[i], coo2int[j]) for i, j in qtn.edges_2d_square(4, 4)
-)
+square_16_edges = tuple((coo2int[i], coo2int[j]) for i, j in qtn.edges_2d_square(4, 4))
 
 coo2int = collections.defaultdict(itertools.count().__next__)
-square_20_edges = tuple(
-    (coo2int[i], coo2int[j]) for i, j in qtn.edges_2d_square(5, 4)
-)
+square_20_edges = tuple((coo2int[i], coo2int[j]) for i, j in qtn.edges_2d_square(5, 4))
 
 coo2int = collections.defaultdict(itertools.count().__next__)
 torus_16_edges = tuple(
@@ -599,9 +610,7 @@ def run_exact(
     if optimize is None:
         optimize = get_optimizer_exact(progbar=progbar)
 
-    final_rx = (
-        measure == "X37,41,52,56,57,58,62,79,Y38,40,42,63,72,80,90,91,Z75"
-    )
+    final_rx = measure == "X37,41,52,56,57,58,62,79,Y38,40,42,63,72,80,90,91,Z75"
 
     circ = make_circuit(
         steps,
@@ -630,10 +639,7 @@ def run_exact(
         # directly contract the full wavefunction
         to_backend = get_to_backend(backend)
         ket.apply_to_arrays(to_backend)
-        tket = ket.contract(
-            optimize=optimize,
-            use_cotengra=True,
-        )
+        tket = ket.contract(optimize=optimize)
         tketG = tket.copy()
         for s, where in pstring.items():
             for q in where:
@@ -675,7 +681,7 @@ def run_bppeps(
     theta_h=8 * pi / 32,
     theta_j=-pi / 2,
     measure="Z62",
-    measure_local_check=62,
+    measure_local_check="auto",
     version="ibm_kyiv",
     chi=8,
     cutoff=5e-6,
@@ -703,14 +709,11 @@ def run_bppeps(
     if tol_final is None:
         tol_final = 10 * tol
 
-    if optimize is None:
-        optimize = get_optimizer_exact(target_size=target_size)
+    optimize = choose_optimizer(optimize, chi, version, target_size)
 
     pstring = parse_string_to_paulis(measure)
     all_qubits = [q for qs in pstring.values() for q in qs]
-    final_rx = (
-        measure == "X37,41,52,56,57,58,62,79,Y38,40,42,63,72,80,90,91,Z75"
-    )
+    final_rx = measure == "X37,41,52,56,57,58,62,79,Y38,40,42,63,72,80,90,91,Z75"
     circ = make_circuit(
         steps,
         theta_h=theta_h,
@@ -727,6 +730,14 @@ def run_bppeps(
 
     if "viagpu" in backend:
         bp_opts["via"] = (torch_to_gpu, torch_to_cpu)
+
+    if measure_local_check == "auto":
+        # check if `measure` is of form "Z{int}"
+        if tuple(pstring.keys()) == ("Z",) and len(pstring["Z"]) == 1:
+            (measure_local_check,) = pstring["Z"]
+        else:
+            # otherwise just pick first qubit
+            measure_local_check = 0
 
     rblock = 0
     for r in range(steps + last_step):
@@ -772,9 +783,7 @@ def run_bppeps(
         return psi
 
     if progbar:
-        print(
-            f"... contract norm and estimate Z{measure_local_check} directly ..."
-        )
+        print(f"... contract norm and estimate Z{measure_local_check} directly ...")
 
     if compute_exact:
         Nex = complex((psi.H & psi).contract(optimize=optimize))
@@ -801,12 +810,14 @@ def run_bppeps(
     if compute_exact:
         Oex = complex(expec.contract(optimize=optimize))
 
+    info = {}
     obs = complex(
         contract_l1bp(
             expec,
             tol=tol_final,
             max_iterations=max_iterations,
             optimize=optimize,
+            info=info,
             progbar=progbar,
             **bp_opts,
         )
@@ -824,6 +835,7 @@ def run_bppeps(
         "Nim": est_norm.imag,
         "Z": Zcheck.real,
         "time": time.time() - t0,
+        "O_converged": info["converged"],
     }
     if compute_exact:
         res["Oex"] = Oex.real
@@ -867,15 +879,12 @@ def run_bppepo(
         # match message sizes in BP2 and BP1 stages
         last_step = max(1, int(log2(chi) / 2))
 
-    if optimize is None:
-        optimize = get_optimizer_exact(target_size=target_size)
+    optimize = choose_optimizer(optimize, chi, version, target_size)
 
     pstring = parse_string_to_paulis(measure)
     all_qubits = [q for qs in pstring.values() for q in qs]
 
-    final_rx = (
-        measure == "X37,41,52,56,57,58,62,79,Y38,40,42,63,72,80,90,91,Z75"
-    )
+    final_rx = measure == "X37,41,52,56,57,58,62,79,Y38,40,42,63,72,80,90,91,Z75"
     circ = make_circuit(
         steps,
         theta_h=theta_h,
@@ -908,6 +917,7 @@ def run_bppepo(
     if return_tn_after == "initial":
         return tn
 
+    r = 0
     rblock = 0
     for r in reversed(range(last_step, steps)):
         # add another layer to the inner PEPO
@@ -967,11 +977,15 @@ def run_bppepo(
         if progbar:
             print("computing norm...")
 
-        tn_inner = tn.select("INNER")
-        bp = L2BP(tn_inner, optimize=optimize, **bp_opts)
-        bp.run(tol=tol, max_iterations=max_iterations, progbar=progbar)
-        _, norm_exponent = bp.contract(strip_exponent=True)
-        N = float(10 ** ((norm_exponent - (len(bp.local_tns) * log10(2))) / 2))
+        try:
+            tn_inner = tn.select("INNER")
+            bp = L2BP(tn_inner, optimize=optimize, **bp_opts)
+            bp.run(tol=tol, max_iterations=max_iterations, progbar=progbar)
+            _, norm_exponent = bp.contract(strip_exponent=True)
+            N = float(10 ** ((norm_exponent - (len(bp.local_tns) * log10(2))) / 2))
+        except KeyError:
+            # no INNER layer becuase small steps value
+            N = 1.0
     else:
         N = None
 
@@ -994,24 +1008,30 @@ def run_bppepo(
         print(xyz.report_memory_gpu())
         print(f"contracting after compressing layer {r}")
 
-    Z = contract_l1bp(
-        tn,
-        tol=tol_final,
-        max_iterations=max_iterations,
-        progbar=progbar,
-        optimize=optimize,
-        **bp_opts,
+    info = {}
+    obs = complex(
+        contract_l1bp(
+            tn,
+            tol=tol_final,
+            max_iterations=max_iterations,
+            optimize=optimize,
+            info=info,
+            progbar=progbar,
+            **bp_opts,
+        )
     )
 
     if progbar:
-        print(f"-> {Z}")
+        print(f"-> {obs}")
         print(xyz.report_memory())
         print(xyz.report_memory_gpu())
 
-    real = ar.to_numpy(Z.real)
-    imag = ar.to_numpy(Z.imag)
-
-    res = {"O": real, "Oim": imag, "time": time.time() - t0}
+    res = {
+        "O": obs.real,
+        "Oim": obs.imag,
+        "O_converged": info["converged"],
+        "time": time.time() - t0,
+    }
     if compute_norm:
         res["N"] = N
     if compute_exact:
@@ -1053,15 +1073,12 @@ def run_bpmixed(
     if tol_final is None:
         tol_final = 10 * tol
 
-    if optimize is None:
-        optimize = get_optimizer_exact(target_size=target_size)
+    optimize = choose_optimizer(optimize, chi, version, target_size)
 
     # get circuit and measurement
     pstring = parse_string_to_paulis(measure)
     all_qubits = [q for qs in pstring.values() for q in qs]
-    final_rx = (
-        measure == "X37,41,52,56,57,58,62,79,Y38,40,42,63,72,80,90,91,Z75"
-    )
+    final_rx = measure == "X37,41,52,56,57,58,62,79,Y38,40,42,63,72,80,90,91,Z75"
     circ = make_circuit(
         steps,
         theta_h=theta_h,
@@ -1086,6 +1103,7 @@ def run_bpmixed(
     psi.apply_to_arrays(to_backend)
 
     # PEPS evolution steps
+    tn_outer = None
     rblock = 0
     for r in range(peps_step):
         # add another layer to the inner PEPO
@@ -1127,14 +1145,18 @@ def run_bpmixed(
     if progbar:
         print("... contracting PEPS norm")
 
-    norm_peps = contract_l2bp(
-        tn_outer,
-        tol=tol,
-        max_iterations=max_iterations,
-        optimize=optimize,
-        progbar=progbar,
-        **bp_opts,
-    )
+    if tn_outer is not None:
+        norm_peps = contract_l2bp(
+            tn_outer,
+            tol=tol,
+            max_iterations=max_iterations,
+            optimize=optimize,
+            progbar=progbar,
+            **bp_opts,
+        )
+    else:
+        # too short depth to have an outer PEPS
+        norm_peps = 1.0
 
     if progbar:
         print(f"-> {norm_peps}")
@@ -1149,14 +1171,14 @@ def run_bpmixed(
     # add measuring gates
     for which, qubits in parse_string_to_paulis(measure).items():
         for q in qubits:
-            ket.gate_inds_(
-                to_backend(qu.pauli(which)), [f"k{q}"], contract=True
-            )
+            ket.gate_inds_(to_backend(qu.pauli(which)), [f"k{q}"], contract=True)
 
     # form full sandwich
     tn = ket | bra
 
     rblock = 0
+    tn_inner = None
+
     for r in reversed(range(pepo_step, steps)):
         tn.retag_({f"ROUND_{r}": "INNER"})
         rblock += 1
@@ -1202,17 +1224,21 @@ def run_bpmixed(
     if progbar:
         print("... contracting PEPO norm")
 
-    bp = L2BP(tn_inner, optimize=optimize, **bp_opts)
-    bp.run(
-        tol=tol,
-        max_iterations=max_iterations,
-        progbar=progbar,
-    )
-    mantissa, norm_exponent = bp.contract(strip_exponent=True)
-    # add contributions from identities missing due to lightcone
-    norm_pepo = (
-        mantissa * 10 ** ((norm_exponent - len(bp.local_tns) * log10(2)))
-    ) ** 0.5
+    if tn_inner is not None:
+        bp = L2BP(tn_inner, optimize=optimize, **bp_opts)
+        bp.run(
+            tol=tol,
+            max_iterations=max_iterations,
+            progbar=progbar,
+        )
+        mantissa, norm_exponent = bp.contract(strip_exponent=True)
+        # add contributions from identities missing due to lightcone
+        norm_pepo = (
+            mantissa * 10 ** (norm_exponent - len(bp.local_tns) * log10(2))
+        ) ** 0.5
+    else:
+        # too short depth to have an inner PEPO
+        norm_pepo = 1.0
 
     if progbar:
         print(f"-> {norm_pepo}")
@@ -1221,13 +1247,17 @@ def run_bpmixed(
         print("!!! contracting observable !!!")
 
     # now run 1-norm BP on the triple sandwich
-    obs = contract_l1bp(
-        tn,
-        optimize=optimize,
-        tol=tol_final,
-        max_iterations=max_iterations,
-        progbar=progbar,
-        **bp_opts,
+    info = {}
+    obs = complex(
+        contract_l1bp(
+            tn,
+            optimize=optimize,
+            tol=tol_final,
+            max_iterations=max_iterations,
+            info=info,
+            progbar=progbar,
+            **bp_opts,
+        )
     )
 
     if progbar:
@@ -1238,11 +1268,11 @@ def run_bpmixed(
     norm_peps = complex(norm_peps)
     norm_pepo = complex(norm_pepo)
     norm = norm_peps * norm_pepo
-    obs = complex(obs)
 
     return {
         "O": obs.real,
         "Oim": obs.imag,
+        "O_converged": info["converged"],
         "Npeps": norm_peps.real,
         "Npeps_im": norm_peps.imag,
         "Npepo": norm_pepo.real,
@@ -1251,4 +1281,3 @@ def run_bpmixed(
         "Nim": norm.imag,
         "time": time.time() - t0,
     }
-
